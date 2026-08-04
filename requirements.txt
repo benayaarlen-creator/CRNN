@@ -1,0 +1,12 @@
+tensorflow==2.21.0
+keras==3.12.2
+h5py==3.14.0
+numpy==2.2.6
+pandas==2.3.3
+scipy==1.15.3
+opencv-python-headless==4.13.0.92
+soundfile==0.14.0
+imageio-ffmpeg==0.6.0
+streamlit==1.60.0
+streamlit-webrtc==0.76.2
+av==17.1.0

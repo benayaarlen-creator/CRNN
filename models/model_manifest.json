@@ -1,0 +1,33 @@
+{
+  "model_name": "CRNN_Model_Level_Fusion_8Class",
+  "format_note": "Legacy Keras 2.10 HDF5 content stored with a .keras suffix",
+  "model_file": "model_lr01f12_best.keras",
+  "learning_rate": 0.0001,
+  "validation_accuracy": 0.7986111044883728,
+  "test_accuracy": 0.75,
+  "visual_fusion_weight": 0.5,
+  "audio_fusion_weight": 0.5,
+  "inputs": {
+    "visual_input": [12, 64, 64, 3],
+    "audio_input": [40, 531, 1]
+  },
+  "class_names": [
+    "neutral",
+    "calm",
+    "happy",
+    "sad",
+    "angry",
+    "fearful",
+    "disgust",
+    "surprised"
+  ],
+  "audio_preprocessing": {
+    "sample_rate": 22050,
+    "n_mfcc": 40,
+    "n_fft": 1024,
+    "win_length": 551,
+    "hop_length": 220,
+    "target_time_steps": 531,
+    "normalization": "Per-MFCC mean/std from training split"
+  }
+}
