@@ -54,6 +54,11 @@ MODEL_PATH = MODEL_DIR / "model_lr01f12_best.keras"
 MFCC_MEAN_PATH = MODEL_DIR / "mfcc_train_mean.npy"
 MFCC_STD_PATH = MODEL_DIR / "mfcc_train_std.npy"
 BASE_MODALITY_SCALE = 0.5
+RTC_CONFIGURATION = {
+    "iceServers": [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+    ]
+}
 
 
 class LiveSession:
@@ -626,6 +631,7 @@ def render_live_tab(
             },
             audio_html_attrs={"muted": True},
             async_processing=False,
+            rtc_configuration=RTC_CONFIGURATION,
         )
         st.caption(
             "Sesi tidak memiliki batas waktu. Audio keluaran dimatikan agar tidak "
