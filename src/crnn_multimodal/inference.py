@@ -59,6 +59,7 @@ NUM_FRAMES = 12
 IMAGE_SIZE = 64
 SAMPLE_RATE = 22_050
 DEFAULT_WINDOW_SECONDS = 3.0
+MIN_RELIABLE_SEGMENT_SECONDS = 2.0
 N_MFCC = 40
 TARGET_TIME_STEPS = 531
 AUDIO_SHAPE = (N_MFCC, TARGET_TIME_STEPS, 1)
@@ -905,24 +906,30 @@ def analyze_video(
     remainder = duration - full_segments * segment_seconds
     if full_segments == 0:
         segment_count = 1
-    elif 0.05 < remainder < 1.0:
+    elif 0.05 < remainder < MIN_RELIABLE_SEGMENT_SECONDS:
         # Absorb a very short tail into the previous segment instead of making
-        # a prediction from only a fraction of a second.
+        # a prediction from a heavily padded audio window.
         segment_count = full_segments
     else:
         segment_count = full_segments + int(remainder > 0.05)
     warnings: list[str] = []
-    if duration < 1.0:
+    if duration < MIN_RELIABLE_SEGMENT_SECONDS:
         warnings.append(
             f"Video hanya berdurasi {duration:.1f} detik; input audio "
             "dipanjangkan dengan padding seperti pada preprocessing training."
         )
-    elif 0.05 < remainder < 1.0 and full_segments > 0:
+    elif (
+        0.05 < remainder < MIN_RELIABLE_SEGMENT_SECONDS
+        and full_segments > 0
+    ):
         warnings.append(
             f"Sisa video {remainder:.1f} detik digabung ke segmen sebelumnya "
             "agar tidak menghasilkan prediksi dari potongan yang terlalu pendek."
         )
-    elif remainder >= 1.0 and remainder < segment_seconds - 0.05:
+    elif (
+        remainder >= MIN_RELIABLE_SEGMENT_SECONDS
+        and remainder < segment_seconds - 0.05
+    ):
         warnings.append(
             f"Segmen terakhir berdurasi {remainder:.1f} detik; input audio "
             "dipanjangkan dengan padding seperti pada preprocessing training."
@@ -933,12 +940,14 @@ def analyze_video(
         wav_path = Path(temp_dir) / "audio.wav"
         has_audio, audio_error = _extract_audio(path, wav_path)
         if not has_audio:
-            warnings.append(
-                "Track audio tidak dapat dibaca; cabang audio memakai tensor nol. "
+            capture.release()
+            raise RuntimeError(
+                "Track audio tidak dapat dibaca. Model multimodal tidak akan "
+                "dipaksakan berjalan dengan audio kosong. "
                 + (audio_error or "")
             )
 
-        audio_file = sf.SoundFile(wav_path) if has_audio else None
+        audio_file = sf.SoundFile(wav_path)
         try:
             for segment_index in range(segment_count):
                 start = segment_index * segment_seconds
@@ -976,9 +985,9 @@ def analyze_video(
                             bundle.train_std,
                         )
                     else:
-                        audio = empty_audio_input()
-                else:
-                    audio = empty_audio_input()
+                        raise RuntimeError(
+                            f"Audio kosong pada segmen {start:.1f}-{end:.1f} detik."
+                        )
 
                 prediction = bundle.predict(visual, audio, audio_focus)
                 preview = frames[len(frames) // 2]

@@ -17,13 +17,15 @@ Keras 3.
 
 - prediksi webcam dan mikrofon tanpa batas waktu;
 - kotak wajah, label emosi, confidence, dan probabilitas delapan kelas;
-- slider fokus visual-suara saat inferensi;
-- interval prediksi live 1-5 detik;
+- fusion visual-suara tetap 50/50 sesuai training;
+- interval prediksi live tetap 3 detik;
 - unggah video dan analisis timeline per segmen;
 - unduh hasil lengkap ke CSV.
 
-Slider fokus bukan `class_weight` training. Posisi 50/50 mempertahankan skala
-asli model, yaitu `0.5` untuk cabang visual dan `0.5` untuk cabang audio.
+Fusion dikunci pada posisi 50/50 agar input tetap sama dengan kondisi training,
+yaitu skala `0.5` untuk cabang visual dan `0.5` untuk cabang audio. Prediksi live
+ditunda ketika wajah atau suara belum tersedia sehingga model tidak dipaksa
+berjalan dalam mode visual-only.
 
 ## Menjalankan secara lokal
 
@@ -61,7 +63,23 @@ python scripts\smoke_test.py --video "C:\path\video.mp4"
 4. Tunggu instalasi paket dari `requirements.txt` dan pemuatan model selesai.
 
 Webcam dan mikrofon browser memerlukan deployment HTTPS. Streamlit Community
-Cloud menyediakan HTTPS secara otomatis.
+Cloud menyediakan HTTPS secara otomatis. Aplikasi juga menyertakan konfigurasi
+STUN Google untuk membantu pembentukan koneksi WebRTC pada server jarak jauh.
+
+### TURN untuk kamera/mikrofon di Community Cloud
+
+Jika log memperlihatkan kegagalan `aioice` atau kamera berhenti pada pesan
+`Connection is taking longer than expected`, gunakan Twilio Network Traversal
+Service. Buat akun Twilio, lalu buka **Manage app → Settings → Secrets** dan isi:
+
+```toml
+TWILIO_ACCOUNT_SID = "AC..."
+TWILIO_AUTH_TOKEN = "..."
+```
+
+Reboot aplikasi setelah menyimpan Secrets. Aplikasi meminta token TURN berumur
+terbatas dari server Twilio dan tidak mengirim Account SID/Auth Token ke browser.
+Jangan menyimpan kredensial asli dalam repository GitHub.
 
 ## Preprocessing
 

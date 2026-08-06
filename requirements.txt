@@ -10,3 +10,4 @@ imageio-ffmpeg==0.6.0
 streamlit==1.60.0
 streamlit-webrtc==0.76.2
 av==17.1.0
+twilio==9.10.9

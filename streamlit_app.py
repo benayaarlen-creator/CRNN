@@ -41,11 +41,9 @@ from crnn_multimodal.inference import (
     audio_frame_to_mono,
     create_face_detector,
     detect_largest_face,
-    empty_audio_input,
     load_model_bundle,
     merge_audio_chunks,
     measure_audio_quality,
-    modality_scales,
     preprocess_audio,
     preprocess_frames,
 )
@@ -54,11 +52,33 @@ MODEL_PATH = MODEL_DIR / "model_lr01f12_best.keras"
 MFCC_MEAN_PATH = MODEL_DIR / "mfcc_train_mean.npy"
 MFCC_STD_PATH = MODEL_DIR / "mfcc_train_std.npy"
 BASE_MODALITY_SCALE = 0.5
-RTC_CONFIGURATION = {
+INFERENCE_AUDIO_FOCUS = 0.5
+ANALYSIS_SEGMENT_SECONDS = 3.0
+LIVE_CONFIDENCE_THRESHOLD = 0.45
+LIVE_SMOOTHING_WINDOW = 3
+STUN_CONFIGURATION = {
     "iceServers": [
         {"urls": ["stun:stun.l.google.com:19302"]},
     ]
 }
+
+
+@st.cache_data(ttl=23 * 60 * 60, show_spinner=False)
+def get_rtc_configuration() -> tuple[dict[str, object], str]:
+    """Use Twilio TURN when credentials exist, otherwise keep a STUN fallback."""
+    try:
+        account_sid = str(st.secrets["TWILIO_ACCOUNT_SID"])
+        auth_token = str(st.secrets["TWILIO_AUTH_TOKEN"])
+    except (KeyError, FileNotFoundError):
+        return STUN_CONFIGURATION, "STUN saja (TURN belum dikonfigurasi)"
+
+    try:
+        from twilio.rest import Client
+
+        token = Client(account_sid, auth_token).tokens.create()
+        return {"iceServers": token.ice_servers}, "TURN Twilio aktif"
+    except Exception as error:
+        return STUN_CONFIGURATION, f"TURN gagal; memakai STUN: {error}"
 
 
 class LiveSession:
@@ -80,7 +100,7 @@ class LiveSession:
         self._prediction_number = 0
         self._last_error: str | None = None
         self._last_traceback: str | None = None
-        self._audio_focus = 0.30
+        self._audio_focus = INFERENCE_AUDIO_FOCUS
         self._auto_quality = True
         self._confidence_threshold = 0.45
         self._smoothing_window = 3
@@ -227,23 +247,14 @@ class LiveSession:
                     bundle.train_mean,
                     bundle.train_std,
                 )
-                if auto_quality and audio_quality.rms < 0.0020:
-                    effective_audio_focus = min(audio_focus, 0.25)
-                    audio_status = "Suara sangat pelan; bobot audio dikurangi."
+                if audio_quality.rms < 0.0020:
+                    audio_status = "Suara pelan, tetapi tetap diproses pada 50/50."
                 else:
                     audio_status = "Sinyal audio terdeteksi."
             else:
-                audio = empty_audio_input()
-                effective_audio_focus = 0.0
                 audio_status = (
-                    "Mikrofon hening/tidak aktif; prediksi memakai visual saja."
+                    "Mikrofon hening/tidak aktif; prediksi multimodal ditunda."
                 )
-
-            raw_prediction = bundle.predict(
-                visual,
-                audio,
-                effective_audio_focus,
-            )
 
             quality: dict[str, object] = {
                 "face_count": face_count,
@@ -256,11 +267,22 @@ class LiveSession:
                 if generation == self._generation:
                     self._last_quality = quality
 
+            if not waveform.size or not audio_quality.has_usable_signal:
+                raise RuntimeError(
+                    "Audio belum tersedia. Model membutuhkan wajah dan suara; "
+                    "prediksi tidak dipaksakan menjadi visual-only."
+                )
             if auto_quality and face_count < 3:
                 raise RuntimeError(
                     f"Wajah hanya terdeteksi pada {face_count}/12 frame. "
                     "Hadapkan wajah ke kamera dan perbaiki pencahayaan."
                 )
+
+            raw_prediction = bundle.predict(
+                visual,
+                audio,
+                effective_audio_focus,
+            )
 
             with self._lock:
                 if generation == self._generation:
@@ -420,40 +442,6 @@ def format_seconds(value: float) -> str:
     return f"{seconds:.1f} detik"
 
 
-def modality_controls(
-    key_prefix: str,
-    default_audio_percent: int = 50,
-    base_scale: float = 1.0,
-) -> float:
-    audio_percent = st.slider(
-        "Fokus visual atau suara",
-        min_value=0,
-        max_value=100,
-        value=default_audio_percent,
-        step=5,
-        key=f"{key_prefix}_audio_focus",
-        help=(
-            "0 = visual saja, 50 = skala asli kedua cabang, dan 100 = suara saja. "
-            "Pengaturan ini adalah bobot saat inferensi, bukan class_weight training."
-        ),
-    )
-    audio_focus = audio_percent / 100.0
-    visual_scale, audio_scale = modality_scales(audio_focus, base_scale)
-    visual_column, audio_column = st.columns(2)
-    visual_column.metric(
-        "Visual", f"{100 - audio_percent}%", f"skala fitur {visual_scale:.2f}"
-    )
-    audio_column.metric(
-        "Suara", f"{audio_percent}%", f"skala fitur {audio_scale:.2f}"
-    )
-    st.caption(
-        "Posisi 50/50 mempertahankan konfigurasi model saat training. "
-        f"Skala dasar model ini {base_scale:.2f} per cabang. "
-        "Posisi lain meredam cabang yang tidak diprioritaskan."
-    )
-    return audio_focus
-
-
 def render_probability_table(prediction: Prediction) -> None:
     probability_frame = pd.DataFrame(
         {
@@ -488,58 +476,24 @@ def render_live_tab(
     )
     video_column, control_column = st.columns([2.25, 1.0], gap="large")
     state = get_live_session(model_path)
+    rtc_configuration, rtc_status = get_rtc_configuration()
 
     with control_column:
-        st.markdown("#### Pengaturan inferensi")
-        audio_focus = modality_controls(
-            "live",
-            default_audio_percent=30,
-            base_scale=bundle.base_modality_scale,
-        )
-        auto_quality = st.checkbox(
-            "Sesuaikan dengan kualitas input",
-            value=True,
-            help=(
-                "Jika mikrofon hening, cabang audio dinonaktifkan otomatis. "
-                "Prediksi juga ditunda jika wajah tidak terlihat stabil."
-            ),
-        )
-        window_seconds = st.slider(
-            "Interval prediksi",
-            min_value=1.0,
-            max_value=5.0,
-            value=DEFAULT_WINDOW_SECONDS,
-            step=0.5,
-            format="%.1f detik",
-            help="Tiga detik adalah nilai bawaan yang aman untuk penggunaan live.",
-        )
-        confidence_threshold = st.slider(
-            "Batas confidence",
-            min_value=0.20,
-            max_value=0.80,
-            value=0.45,
-            step=0.05,
-            format="%.2f",
-            help=(
-                "Di bawah batas ini label ditampilkan sebagai Tidak yakin, "
-                "bukan dipaksakan menjadi salah satu emosi."
-            ),
-        )
-        smoothing_window = st.slider(
-            "Perataan prediksi terakhir",
-            min_value=1,
-            max_value=5,
-            value=3,
-            step=1,
-            help="Nilai 3 mengurangi perubahan label akibat satu jendela yang noisy.",
+        st.markdown("#### Konfigurasi tetap")
+        fixed_visual, fixed_audio = st.columns(2)
+        fixed_visual.metric("Visual", "50%")
+        fixed_audio.metric("Suara", "50%")
+        st.caption(
+            "Fusion dikunci pada konfigurasi training. Prediksi hanya dijalankan "
+            "ketika wajah dan suara tersedia."
         )
         state.configure(
-            audio_focus,
-            auto_quality,
-            confidence_threshold,
-            smoothing_window,
+            INFERENCE_AUDIO_FOCUS,
+            True,
+            LIVE_CONFIDENCE_THRESHOLD,
+            LIVE_SMOOTHING_WINDOW,
         )
-        state.set_window_seconds(window_seconds)
+        state.set_window_seconds(DEFAULT_WINDOW_SECONDS)
         if st.button("Reset hasil live", width="stretch"):
             state.reset()
 
@@ -631,8 +585,15 @@ def render_live_tab(
             },
             audio_html_attrs={"muted": True},
             async_processing=False,
-            rtc_configuration=RTC_CONFIGURATION,
+            rtc_configuration=rtc_configuration,
         )
+        if rtc_status == "TURN Twilio aktif":
+            st.success(rtc_status)
+        else:
+            st.warning(
+                rtc_status
+                + ". Streamlit Cloud dapat memerlukan TURN agar kamera tersambung."
+            )
         st.caption(
             "Sesi tidak memiliki batas waktu. Audio keluaran dimatikan agar tidak "
             "memantul, tetapi mikrofon tetap dipakai oleh model."
@@ -731,24 +692,18 @@ def render_upload_tab(bundle: ModelBundle, model_path: Path) -> None:
     )
     input_column, settings_column = st.columns([2.0, 1.0], gap="large")
     with settings_column:
-        st.markdown("#### Pengaturan analisis")
-        audio_focus = modality_controls(
-            "upload",
-            base_scale=bundle.base_modality_scale,
-        )
-        segment_seconds = st.slider(
-            "Durasi setiap segmen",
-            min_value=1.0,
-            max_value=5.0,
-            value=DEFAULT_WINDOW_SECONDS,
-            step=0.5,
-            format="%.1f detik",
-            help="Model akan mengambil 12 frame merata dari setiap segmen.",
-        )
+        st.markdown("#### Konfigurasi analisis")
+        fixed_visual, fixed_audio = st.columns(2)
+        fixed_visual.metric("Visual", "50%")
+        fixed_audio.metric("Suara", "50%")
+        st.metric("Durasi setiap segmen", "3 detik")
         st.info(
-            "Nilai 3 detik direkomendasikan. Segmen lebih pendek akan dipadding "
-            "dan segmen terakhir tetap dianalisis."
+            "Konfigurasi dikunci agar konsisten dengan training. Setiap segmen "
+            "mengambil 12 frame dan track audio yang sesuai."
         )
+
+    audio_focus = INFERENCE_AUDIO_FOCUS
+    segment_seconds = ANALYSIS_SEGMENT_SECONDS
 
     with input_column:
         uploaded = st.file_uploader(
@@ -807,7 +762,7 @@ def render_upload_tab(bundle: ModelBundle, model_path: Path) -> None:
             if saved:
                 if saved["signature"] != run_signature:
                     st.warning(
-                        "Video, model, durasi segmen, atau bobot modalitas berubah. "
+                        "Video atau model berubah. "
                         "Tekan **Analisis video** untuk memperbarui hasil."
                     )
                 else:
@@ -892,9 +847,9 @@ def main() -> None:
     with st.sidebar:
         st.success("Model siap digunakan")
         st.write(f"Ukuran: {model_path.stat().st_size / (1024 * 1024):.2f} MB")
-        st.warning(
-            "Slider fokus adalah eksperimen bobot inferensi, bukan class_weight "
-            "training. Nilai evaluasi model berlaku pada posisi asli 50/50."
+        st.info(
+            "Fusion dikunci pada visual 50% dan suara 50%, sesuai konfigurasi "
+            "training dan evaluasi model."
         )
 
     live_tab, upload_tab, info_tab = st.tabs(
