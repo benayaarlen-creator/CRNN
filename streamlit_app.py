@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
+import subprocess
 import sys
 import tempfile
-import threading
-import time
-import traceback
-from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -21,389 +21,71 @@ RUNTIME_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("NUMBA_CACHE_DIR", str(RUNTIME_CACHE_DIR / "numba"))
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
-import av
 import cv2
+import imageio_ffmpeg
 import numpy as np
 import pandas as pd
+import soundfile as sf
 import streamlit as st
-from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
+import crnn_multimodal.inference as inference
 from crnn_multimodal.inference import (
-    AudioQuality,
     CLASS_DISPLAY_NAMES,
     CLASS_NAMES,
     DEFAULT_WINDOW_SECONDS,
     ModelBundle,
     Prediction,
-    SegmentPrediction,
-    analyze_video,
     annotate_frame,
-    audio_frame_to_mono,
-    create_face_detector,
-    detect_largest_face,
     load_model_bundle,
-    merge_audio_chunks,
     measure_audio_quality,
     preprocess_audio,
     preprocess_frames,
 )
+
+
 MODEL_DIR = PROJECT_ROOT / "models"
 MODEL_PATH = MODEL_DIR / "model_lr01f12_best.keras"
 MFCC_MEAN_PATH = MODEL_DIR / "mfcc_train_mean.npy"
 MFCC_STD_PATH = MODEL_DIR / "mfcc_train_std.npy"
-BASE_MODALITY_SCALE = 0.5
-INFERENCE_AUDIO_FOCUS = 0.5
-ANALYSIS_SEGMENT_SECONDS = 3.0
-LIVE_CONFIDENCE_THRESHOLD = 0.45
-LIVE_SMOOTHING_WINDOW = 3
-STUN_CONFIGURATION = {
-    "iceServers": [
-        {"urls": ["stun:stun.l.google.com:19302"]},
-    ]
+
+SEGMENT_DURATION_OPTIONS = (1, 2, 3)
+DETECTION_MODE_LABELS = {
+    "Normal": "normal",
+    "Jarak jauh (eksperimen)": "far",
 }
+MODEL_FUSION_SETTING = 0.5
+CONFIDENCE_THRESHOLD = 0.45
+MODEL_FRAME_COUNT = 12
 
 
-@st.cache_data(ttl=23 * 60 * 60, show_spinner=False)
-def get_rtc_configuration() -> tuple[dict[str, object], str]:
-    """Use Twilio TURN when credentials exist, otherwise keep a STUN fallback."""
-    try:
-        account_sid = str(st.secrets["TWILIO_ACCOUNT_SID"])
-        auth_token = str(st.secrets["TWILIO_AUTH_TOKEN"])
-    except (KeyError, FileNotFoundError):
-        return STUN_CONFIGURATION, "STUN saja (TURN belum dikonfigurasi)"
+@dataclass(frozen=True)
+class AppSegmentPrediction:
+    """Hasil prediksi satu potongan video."""
 
-    try:
-        from twilio.rest import Client
+    start_seconds: float
+    end_seconds: float
+    prediction: Prediction
+    face_detected: bool
+    face_count: int
+    preview_bgr: np.ndarray
+    audio_used: bool
 
-        token = Client(account_sid, auth_token).tokens.create()
-        return {"iceServers": token.ice_servers}, "TURN Twilio aktif"
-    except Exception as error:
-        return STUN_CONFIGURATION, f"TURN gagal; memakai STUN: {error}"
-
-
-class LiveSession:
-    """Thread-safe rolling audio/video buffers for an unlimited WebRTC session."""
-
-    def __init__(self) -> None:
-        self._lock = threading.RLock()
-        self._detector_lock = threading.Lock()
-        self._executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="crnn-keras-live"
-        )
-        self._detector = create_face_detector()
-        self._frames: list[np.ndarray] = []
-        self._audio_chunks: list[tuple[np.ndarray, int]] = []
-        self._window_started_at: float | None = None
-        self._last_stored_frame_at = 0.0
-        self._processing = False
-        self._prediction: Prediction | None = None
-        self._prediction_number = 0
-        self._last_error: str | None = None
-        self._last_traceback: str | None = None
-        self._audio_focus = INFERENCE_AUDIO_FOCUS
-        self._auto_quality = True
-        self._confidence_threshold = 0.45
-        self._smoothing_window = 3
-        self._probability_history: list[np.ndarray] = []
-        self._last_quality: dict[str, object] | None = None
-        self._window_seconds = DEFAULT_WINDOW_SECONDS
-        self._generation = 0
-        self._overlay_face_box: tuple[int, int, int, int] | None = None
-        self._last_overlay_detection_at = 0.0
-
-    def configure(
-        self,
-        audio_focus: float,
-        auto_quality: bool,
-        confidence_threshold: float,
-        smoothing_window: int,
-    ) -> None:
-        with self._lock:
-            audio_focus = float(np.clip(audio_focus, 0.0, 1.0))
-            smoothing_window = int(np.clip(smoothing_window, 1, 5))
-            prediction_settings_changed = (
-                not np.isclose(audio_focus, self._audio_focus)
-                or bool(auto_quality) != self._auto_quality
-                or smoothing_window != self._smoothing_window
-            )
-            self._audio_focus = audio_focus
-            self._auto_quality = bool(auto_quality)
-            self._confidence_threshold = float(
-                np.clip(confidence_threshold, 0.0, 1.0)
-            )
-            self._smoothing_window = smoothing_window
-            if prediction_settings_changed:
-                self._probability_history.clear()
-
-    def set_window_seconds(self, value: float) -> None:
-        with self._lock:
-            value = float(np.clip(value, 1.0, 5.0))
-            if not np.isclose(value, self._window_seconds):
-                self._window_seconds = value
-                self._frames.clear()
-                self._audio_chunks.clear()
-                self._window_started_at = None
-                self._probability_history.clear()
-                self._generation += 1
-
-    def reset(self) -> None:
-        with self._lock:
-            self._frames.clear()
-            self._audio_chunks.clear()
-            self._window_started_at = None
-            self._last_stored_frame_at = 0.0
-            self._prediction = None
-            self._prediction_number = 0
-            self._last_error = None
-            self._last_traceback = None
-            self._last_quality = None
-            self._probability_history.clear()
-            self._processing = False
-            self._generation += 1
-
-    def add_audio(self, frame: av.AudioFrame) -> None:
-        try:
-            chunk = audio_frame_to_mono(frame)
-        except Exception as error:
-            with self._lock:
-                self._last_error = f"Audio live gagal dibaca: {error}"
-                self._last_traceback = traceback.format_exc()
-            return
-        with self._lock:
-            if self._window_started_at is None:
-                return
-            self._audio_chunks.append(chunk)
-            if len(self._audio_chunks) > 1_000:
-                self._audio_chunks = self._audio_chunks[-500:]
-
-    def add_video(
-        self,
-        frame_bgr: np.ndarray,
-        bundle: ModelBundle,
-    ) -> None:
-        now = time.monotonic()
-        job: tuple[
-            list[np.ndarray],
-            list[tuple[np.ndarray, int]],
-            float,
-            bool,
-            int,
-            int,
-        ] | None = None
-        with self._lock:
-            if self._window_started_at is None:
-                self._window_started_at = now
-
-            # Eight stored frames per second are enough for uniform sampling of
-            # the 12 frames expected by the model.
-            if now - self._last_stored_frame_at >= 0.125:
-                self._frames.append(frame_bgr.copy())
-                self._last_stored_frame_at = now
-
-            elapsed = now - self._window_started_at
-            if (
-                elapsed >= self._window_seconds
-                and not self._processing
-                and self._frames
-            ):
-                job = (
-                    self._frames,
-                    self._audio_chunks,
-                    self._audio_focus,
-                    self._auto_quality,
-                    self._smoothing_window,
-                    self._generation,
-                )
-                self._frames = []
-                self._audio_chunks = []
-                self._window_started_at = now
-                self._processing = True
-                self._last_error = None
-                self._last_traceback = None
-
-        if job is not None:
-            self._executor.submit(self._run_prediction, bundle, *job)
-
-    def _run_prediction(
-        self,
-        bundle: ModelBundle,
-        frames: list[np.ndarray],
-        audio_chunks: list[tuple[np.ndarray, int]],
-        audio_focus: float,
-        auto_quality: bool,
-        smoothing_window: int,
-        generation: int,
-    ) -> None:
-        try:
-            visual, visual_info = preprocess_frames(frames)
-            face_count = int(visual_info["face_detected_count"])
-            waveform = merge_audio_chunks(audio_chunks)
-            audio_quality = measure_audio_quality(waveform, 22_050)
-            effective_audio_focus = audio_focus
-            if waveform.size and audio_quality.has_usable_signal:
-                audio = preprocess_audio(
-                    waveform,
-                    22_050,
-                    bundle.train_mean,
-                    bundle.train_std,
-                )
-                if audio_quality.rms < 0.0020:
-                    audio_status = "Suara pelan, tetapi tetap diproses pada 50/50."
-                else:
-                    audio_status = "Sinyal audio terdeteksi."
-            else:
-                audio_status = (
-                    "Mikrofon hening/tidak aktif; prediksi multimodal ditunda."
-                )
-
-            quality: dict[str, object] = {
-                "face_count": face_count,
-                "audio": audio_quality,
-                "audio_status": audio_status,
-                "requested_audio_focus": audio_focus,
-                "effective_audio_focus": effective_audio_focus,
-            }
-            with self._lock:
-                if generation == self._generation:
-                    self._last_quality = quality
-
-            if not waveform.size or not audio_quality.has_usable_signal:
-                raise RuntimeError(
-                    "Audio belum tersedia. Model membutuhkan wajah dan suara; "
-                    "prediksi tidak dipaksakan menjadi visual-only."
-                )
-            if auto_quality and face_count < 3:
-                raise RuntimeError(
-                    f"Wajah hanya terdeteksi pada {face_count}/12 frame. "
-                    "Hadapkan wajah ke kamera dan perbaiki pencahayaan."
-                )
-
-            raw_prediction = bundle.predict(
-                visual,
-                audio,
-                effective_audio_focus,
-            )
-
-            with self._lock:
-                if generation == self._generation:
-                    self._probability_history.append(
-                        raw_prediction.probabilities.copy()
-                    )
-                    self._probability_history = self._probability_history[
-                        -smoothing_window:
-                    ]
-                    averaged = np.mean(
-                        np.stack(self._probability_history), axis=0
-                    ).astype(np.float32)
-                    class_index = int(np.argmax(averaged))
-                    prediction = Prediction(
-                        label=CLASS_NAMES[class_index],
-                        confidence=float(averaged[class_index]),
-                        probabilities=averaged,
-                    )
-                    self._prediction = prediction
-                    self._prediction_number += 1
-                    self._last_error = None
-                    self._last_traceback = None
-        except Exception as error:
-            error_traceback = traceback.format_exc()
-            print(error_traceback, file=sys.stderr, flush=True)
-            with self._lock:
-                if generation == self._generation:
-                    self._last_error = f"Prediksi live gagal: {error}"
-                    self._last_traceback = error_traceback
-        finally:
-            with self._lock:
-                if generation == self._generation:
-                    self._processing = False
-
-    def render(self, frame_bgr: np.ndarray) -> np.ndarray:
-        now = time.monotonic()
-        with self._lock:
-            prediction = self._prediction
-            processing = self._processing
-            window_started_at = self._window_started_at
-            window_seconds = self._window_seconds
-            audio_focus = self._audio_focus
-            confidence_threshold = self._confidence_threshold
-            quality = self._last_quality
-            should_detect = now - self._last_overlay_detection_at >= 0.30
-
-        if should_detect:
-            with self._detector_lock:
-                face_box = detect_largest_face(
-                    frame_bgr,
-                    self._detector,
-                    max_detection_side=480,
-                )
-            with self._lock:
-                self._overlay_face_box = face_box
-                self._last_overlay_detection_at = now
-
-        with self._lock:
-            face_box = self._overlay_face_box
-
-        if prediction is None:
-            if processing:
-                status = "Memproses prediksi..."
-            elif window_started_at is None:
-                status = "Menunggu kamera..."
-            else:
-                remaining = max(
-                    0.0, window_seconds - (now - window_started_at)
-                )
-                status = f"Mengumpulkan data {remaining:.1f}s"
-        else:
-            status = None
-
-        annotated, _ = annotate_frame(
-            frame_bgr,
-            prediction,
-            status_text=status,
-            face_box=face_box,
-            detect_face=False,
-            confidence_threshold=confidence_threshold,
-        )
-        effective_audio_focus = (
-            float(quality["effective_audio_focus"])
-            if quality is not None
-            else audio_focus
-        )
-        visual_percent = int(round((1.0 - effective_audio_focus) * 100.0))
-        audio_percent = 100 - visual_percent
-        focus_text = (
-            f"Fokus efektif visual {visual_percent}% | suara {audio_percent}%"
-        )
-        cv2.putText(
-            annotated,
-            focus_text,
-            (20, annotated.shape[0] - 22),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.58,
-            (245, 245, 245),
-            2,
-            cv2.LINE_AA,
-        )
-        return annotated
-
-    def snapshot(self) -> dict[str, object]:
-        with self._lock:
-            elapsed = (
-                0.0
-                if self._window_started_at is None
-                else time.monotonic() - self._window_started_at
-            )
-            return {
-                "prediction": self._prediction,
-                "prediction_number": self._prediction_number,
-                "processing": self._processing,
-                "elapsed": elapsed,
-                "window_seconds": self._window_seconds,
-                "error": self._last_error,
-                "traceback": self._last_traceback,
-                "quality": self._last_quality,
-                "confidence_threshold": self._confidence_threshold,
-            }
+    def as_row(self) -> dict[str, object]:
+        label = self.prediction.label
+        display_label = CLASS_DISPLAY_NAMES.get(label, label)
+        row: dict[str, object] = {
+            "mulai_detik": round(self.start_seconds, 2),
+            "selesai_detik": round(self.end_seconds, 2),
+            "emosi": display_label,
+            "kelas_model": label,
+            "confidence_persen": round(self.prediction.confidence * 100.0, 2),
+            "wajah_terdeteksi": self.face_detected,
+            "frame_wajah": self.face_count,
+            "audio_digunakan": self.audio_used,
+        }
+        for name, value in zip(CLASS_NAMES, self.prediction.probabilities):
+            row[f"prob_{name}_persen"] = round(float(value) * 100.0, 2)
+        return row
 
 
 @st.cache_resource(show_spinner=False)
@@ -414,234 +96,413 @@ def get_model_bundle(
     mean_modified_ns: int,
     std_path: str,
     std_modified_ns: int,
-    base_modality_scale: float,
 ) -> ModelBundle:
+    """Memuat model dan statistik normalisasi sekali."""
     del model_modified_ns, mean_modified_ns, std_modified_ns
     return load_model_bundle(
         model_path,
         mean_path,
         std_path,
-        base_modality_scale=base_modality_scale,
+        base_modality_scale=MODEL_FUSION_SETTING,
     )
 
 
-def get_live_session(model_path: Path) -> LiveSession:
-    if "live_session" not in st.session_state:
-        st.session_state.live_session = LiveSession()
-        st.session_state.live_model_path = str(model_path)
-    elif st.session_state.get("live_model_path") != str(model_path):
-        st.session_state.live_session.reset()
-        st.session_state.live_model_path = str(model_path)
-    return st.session_state.live_session
-
-
 def format_seconds(value: float) -> str:
+    """Mengubah detik menjadi teks yang mudah dibaca."""
     minutes, seconds = divmod(value, 60.0)
     if minutes >= 1:
         return f"{int(minutes):02d}:{seconds:04.1f}"
     return f"{seconds:.1f} detik"
 
 
-def render_probability_table(prediction: Prediction) -> None:
-    probability_frame = pd.DataFrame(
-        {
-            "Emosi": [CLASS_DISPLAY_NAMES[name] for name in CLASS_NAMES],
-            "Kelas model": CLASS_NAMES,
-            "Probabilitas": prediction.probabilities,
-        }
-    ).sort_values("Probabilitas", ascending=False)
-    st.dataframe(
-        probability_frame,
-        hide_index=True,
-        width="stretch",
-        column_config={
-            "Probabilitas": st.column_config.ProgressColumn(
-                "Probabilitas",
-                min_value=0.0,
-                max_value=1.0,
-                format="percent",
+def enhance_frames_for_far_detection(
+    frames: list[np.ndarray],
+) -> list[np.ndarray]:
+    """Memperjelas dan memperbesar frame agar wajah kecil lebih mudah dicari."""
+    enhanced: list[np.ndarray] = []
+    for frame in frames:
+        height, width = frame.shape[:2]
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        lightness, channel_a, channel_b = cv2.split(lab)
+        lightness = cv2.createCLAHE(
+            clipLimit=2.0,
+            tileGridSize=(8, 8),
+        ).apply(lightness)
+        result = cv2.cvtColor(
+            cv2.merge((lightness, channel_a, channel_b)),
+            cv2.COLOR_LAB2BGR,
+        )
+
+        scale = min(2.0, max(1.0, 1280.0 / max(height, width)))
+        if scale > 1.0:
+            result = cv2.resize(
+                result,
+                None,
+                fx=scale,
+                fy=scale,
+                interpolation=cv2.INTER_CUBIC,
             )
-        },
+        enhanced.append(result)
+    return enhanced
+
+
+def sample_segment_frames(
+    capture: cv2.VideoCapture,
+    start_seconds: float,
+    end_seconds: float,
+) -> list[np.ndarray]:
+    """Mengambil 12 frame secara merata dari satu segmen."""
+    if end_seconds <= start_seconds:
+        return []
+
+    fps = float(capture.get(cv2.CAP_PROP_FPS))
+    if fps <= 0:
+        fps = 25.0
+
+    last_time = max(start_seconds, end_seconds - (1.0 / fps))
+    sample_times = np.linspace(
+        start_seconds,
+        last_time,
+        MODEL_FRAME_COUNT,
     )
 
+    frames: list[np.ndarray] = []
+    for timestamp in sample_times:
+        capture.set(cv2.CAP_PROP_POS_MSEC, float(timestamp) * 1000.0)
+        ok, frame = capture.read()
+        if ok and frame is not None:
+            frames.append(frame)
 
-def render_live_tab(
+    if not frames:
+        return []
+
+    while len(frames) < MODEL_FRAME_COUNT:
+        frames.append(frames[-1].copy())
+    return frames[:MODEL_FRAME_COUNT]
+
+
+def extract_audio_track(
+    video_path: Path,
+    wav_path: Path,
+) -> tuple[bool, str | None]:
+    """Mengekstrak audio mono menggunakan fungsi proyek atau FFmpeg."""
+    project_extractor = getattr(inference, "_extract_audio", None)
+    if callable(project_extractor):
+        try:
+            return project_extractor(video_path, wav_path)
+        except Exception as error:
+            project_error = str(error)
+    else:
+        project_error = None
+
+    sample_rate = int(getattr(inference, "SAMPLE_RATE", 22_050))
+    command = [
+        imageio_ffmpeg.get_ffmpeg_exe(),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(video_path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        str(sample_rate),
+        "-c:a",
+        "pcm_s16le",
+        str(wav_path),
+    ]
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode == 0 and wav_path.is_file():
+        return True, None
+
+    message = completed.stderr.strip() or project_error or "Track audio tidak ditemukan."
+    return False, message
+
+
+def create_empty_audio_input(
     bundle: ModelBundle,
-    model_path: Path,
-) -> None:
-    st.subheader("Prediksi langsung tanpa batas waktu")
-    st.write(
-        "Tekan **START**, lalu izinkan kamera dan mikrofon. "
-        "Kotak wajah dan label emosi akan diperbarui berulang kali."
+    sample_rate: int,
+) -> np.ndarray:
+    """Membuat input audio nol dengan bentuk yang diminta model."""
+    duration = max(float(DEFAULT_WINDOW_SECONDS), 1.0)
+    waveform = np.zeros(
+        max(1, int(round(sample_rate * duration))),
+        dtype=np.float32,
     )
-    video_column, control_column = st.columns([2.25, 1.0], gap="large")
-    state = get_live_session(model_path)
-    rtc_configuration, rtc_status = get_rtc_configuration()
 
-    with control_column:
-        st.markdown("#### Konfigurasi tetap")
-        fixed_visual, fixed_audio = st.columns(2)
-        fixed_visual.metric("Visual", "50%")
-        fixed_audio.metric("Suara", "50%")
-        st.caption(
-            "Fusion dikunci pada konfigurasi training. Prediksi hanya dijalankan "
-            "ketika wajah dan suara tersedia."
+    try:
+        template = preprocess_audio(
+            waveform,
+            sample_rate,
+            bundle.train_mean,
+            bundle.train_std,
         )
-        state.configure(
-            INFERENCE_AUDIO_FOCUS,
-            True,
-            LIVE_CONFIDENCE_THRESHOLD,
-            LIVE_SMOOTHING_WINDOW,
-        )
-        state.set_window_seconds(DEFAULT_WINDOW_SECONDS)
-        if st.button("Reset hasil live", width="stretch"):
-            state.reset()
+        return np.zeros_like(template, dtype=np.float32)
+    except Exception:
+        pass
 
-        @st.fragment(run_every="1s")
-        def live_status() -> None:
-            snapshot = state.snapshot()
-            error = snapshot["error"]
-            prediction = snapshot["prediction"]
-            quality = snapshot["quality"]
-            if error:
-                st.error(str(error))
-                if snapshot["traceback"]:
-                    with st.expander("Detail teknis error"):
-                        st.code(str(snapshot["traceback"]), language=None)
-            elif snapshot["processing"]:
-                st.info("Model sedang memproses jendela terbaru...")
-            elif prediction is None:
-                remaining = max(
-                    0.0,
-                    float(snapshot["window_seconds"])
-                    - float(snapshot["elapsed"]),
-                )
-                st.info(f"Menunggu prediksi pertama: {remaining:.1f} detik")
-            else:
-                assert isinstance(prediction, Prediction)
-                message = (
-                    f"Prediksi #{snapshot['prediction_number']}: "
-                    f"{prediction.display_label.upper()} "
-                    f"({prediction.confidence * 100:.1f}%)"
-                )
-                if prediction.confidence < float(
-                    snapshot["confidence_threshold"]
-                ):
-                    st.warning(
-                        "TIDAK YAKIN - kandidat tertinggi: " + message
-                    )
-                else:
-                    st.success(message)
-                render_probability_table(prediction)
-
-            if quality is not None:
-                audio_quality = quality["audio"]
-                assert isinstance(audio_quality, AudioQuality)
-                quality_a, quality_b = st.columns(2)
-                quality_a.metric(
-                    "Wajah terbaca",
-                    f"{quality['face_count']}/12 frame",
-                )
-                quality_b.metric(
-                    "Level suara",
-                    f"{audio_quality.dbfs:.1f} dBFS",
-                )
-                requested = int(
-                    round(float(quality["requested_audio_focus"]) * 100)
-                )
-                effective = int(
-                    round(float(quality["effective_audio_focus"]) * 100)
-                )
-                st.caption(
-                    f"{quality['audio_status']} Fokus audio diminta "
-                    f"{requested}%, efektif {effective}%."
-                )
-
-        live_status()
-
-    def video_callback(frame: av.VideoFrame) -> av.VideoFrame:
-        image = frame.to_ndarray(format="bgr24")
-        state.add_video(image, bundle)
-        result = state.render(image)
-        return av.VideoFrame.from_ndarray(result, format="bgr24")
-
-    def audio_callback(frame: av.AudioFrame) -> av.AudioFrame:
-        state.add_audio(frame)
-        return frame
-
-    with video_column:
-        webrtc_streamer(
-            key="crnn-keras-live-camera-multimodal",
-            mode=WebRtcMode.SENDRECV,
-            video_frame_callback=video_callback,
-            audio_frame_callback=audio_callback,
-            media_stream_constraints={
-                "video": {
-                    "width": {"ideal": 960},
-                    "height": {"ideal": 540},
-                    "frameRate": {"ideal": 24, "max": 30},
-                },
-                "audio": True,
-            },
-            audio_html_attrs={"muted": True},
-            async_processing=False,
-            rtc_configuration=rtc_configuration,
-        )
-        if rtc_status == "TURN Twilio aktif":
-            st.success(rtc_status)
-        else:
-            st.warning(
-                rtc_status
-                + ". Streamlit Cloud dapat memerlukan TURN agar kamera tersambung."
+    for attribute in ("base_model", "model", "keras_model"):
+        model = getattr(bundle, attribute, None)
+        inputs = getattr(model, "inputs", None)
+        if not inputs:
+            continue
+        for model_input in inputs:
+            shape = tuple(
+                int(value) if value is not None else 1
+                for value in model_input.shape
             )
-        st.caption(
-            "Sesi tidak memiliki batas waktu. Audio keluaran dimatikan agar tidak "
-            "memantul, tetapi mikrofon tetap dipakai oleh model."
+            input_name = str(getattr(model_input, "name", "")).lower()
+            if "audio" in input_name or len(shape) == 4:
+                return np.zeros(shape, dtype=np.float32)
+
+    raise RuntimeError("Bentuk input audio model tidak dapat ditentukan.")
+
+
+def audio_is_usable(
+    waveform: np.ndarray,
+    sample_rate: int,
+) -> bool:
+    """Menentukan apakah audio cukup terbaca untuk digunakan."""
+    waveform = np.asarray(waveform, dtype=np.float32).reshape(-1)
+    if not waveform.size or not np.isfinite(waveform).all():
+        return False
+
+    try:
+        quality = measure_audio_quality(waveform, sample_rate)
+        return bool(quality.has_usable_signal)
+    except Exception:
+        rms = float(
+            np.sqrt(
+                np.mean(
+                    np.square(waveform, dtype=np.float64)
+                )
+            )
+        )
+        minimum_rms = float(getattr(inference, "MIN_AUDIO_RMS", 1e-4))
+        return np.isfinite(rms) and rms >= minimum_rms
+
+
+def analyze_video_recording(
+    video_path: Path,
+    bundle: ModelBundle,
+    segment_seconds: int,
+    detection_mode: str,
+    *,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> tuple[list[AppSegmentPrediction], list[str]]:
+    """Menganalisis seluruh video, termasuk segmen dengan audio hening."""
+    if segment_seconds not in SEGMENT_DURATION_OPTIONS:
+        raise ValueError("Interval prediksi harus 1, 2, atau 3 detik.")
+    if detection_mode not in DETECTION_MODE_LABELS.values():
+        raise ValueError("Mode deteksi wajah tidak valid.")
+
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"Video tidak dapat dibuka: {video_path}")
+
+    fps = float(capture.get(cv2.CAP_PROP_FPS))
+    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    if fps <= 0 or frame_count <= 0:
+        capture.release()
+        raise RuntimeError("Metadata durasi video tidak valid.")
+
+    duration = frame_count / fps
+    segment_count = max(
+        1,
+        int(math.ceil(duration / float(segment_seconds))),
+    )
+
+    sample_rate = int(getattr(inference, "SAMPLE_RATE", 22_050))
+    empty_audio = create_empty_audio_input(bundle, sample_rate)
+
+    results: list[AppSegmentPrediction] = []
+    warnings: list[str] = []
+    silent_audio_count = 0
+    failed_frame_count = 0
+
+    with tempfile.TemporaryDirectory(prefix="crnn8_audio_") as temp_dir:
+        wav_path = Path(temp_dir) / "audio.wav"
+        has_audio, audio_error = extract_audio_track(video_path, wav_path)
+        audio_file = sf.SoundFile(wav_path) if has_audio else None
+
+        try:
+            for segment_index in range(segment_count):
+                start = segment_index * float(segment_seconds)
+                end = min(duration, start + float(segment_seconds))
+                frames = sample_segment_frames(capture, start, end)
+
+                if not frames:
+                    failed_frame_count += 1
+                    if progress_callback:
+                        progress_callback(segment_index + 1, segment_count)
+                    continue
+
+                frames_for_model = (
+                    enhance_frames_for_far_detection(frames)
+                    if detection_mode == "far"
+                    else frames
+                )
+
+                audio = empty_audio.copy()
+                audio_used = False
+
+                if audio_file is not None:
+                    source_rate = int(audio_file.samplerate)
+                    audio_file.seek(int(round(start * source_rate)))
+                    requested_samples = max(
+                        1,
+                        int(math.ceil((end - start) * source_rate)),
+                    )
+                    waveform = audio_file.read(
+                        frames=requested_samples,
+                        dtype="float32",
+                        always_2d=False,
+                    )
+                    waveform_array = np.asarray(
+                        waveform,
+                        dtype=np.float32,
+                    ).reshape(-1)
+
+                    if audio_is_usable(waveform_array, source_rate):
+                        audio = preprocess_audio(
+                            waveform_array,
+                            source_rate,
+                            bundle.train_mean,
+                            bundle.train_std,
+                        )
+                        audio_used = True
+
+                if not audio_used:
+                    silent_audio_count += 1
+
+                visual, visual_info = preprocess_frames(frames_for_model)
+                face_count = int(
+                    visual_info.get("face_detected_count", 0)
+                    if isinstance(visual_info, dict)
+                    else 0
+                )
+
+                prediction = bundle.predict(
+                    visual,
+                    audio,
+                    MODEL_FUSION_SETTING,
+                )
+
+                preview = frames_for_model[len(frames_for_model) // 2]
+                annotated, annotated_face = annotate_frame(
+                    preview,
+                    prediction,
+                    confidence_threshold=CONFIDENCE_THRESHOLD,
+                )
+
+                results.append(
+                    AppSegmentPrediction(
+                        start_seconds=start,
+                        end_seconds=end,
+                        prediction=prediction,
+                        face_detected=bool(annotated_face or face_count > 0),
+                        face_count=face_count,
+                        preview_bgr=annotated,
+                        audio_used=audio_used,
+                    )
+                )
+
+                if progress_callback:
+                    progress_callback(segment_index + 1, segment_count)
+        finally:
+            if audio_file is not None:
+                audio_file.close()
+            capture.release()
+
+    if silent_audio_count:
+        warnings.append(
+            f"{silent_audio_count} segmen memakai input audio nol karena suara hening atau tidak tersedia."
+        )
+    if not has_audio and audio_error:
+        warnings.append("Track audio tidak digunakan: " + audio_error)
+    if failed_frame_count:
+        warnings.append(
+            f"{failed_frame_count} segmen dilewati karena frame video gagal dibaca."
         )
 
+    return results, warnings
 
-def render_segment_preview(results: list[SegmentPrediction]) -> None:
+
+def render_segment_preview(
+    results: list[AppSegmentPrediction],
+) -> None:
+    """Menampilkan frame dari segmen yang dipilih."""
     choices = {
-        f"{format_seconds(item.start_seconds)} - {format_seconds(item.end_seconds)} | "
-        f"{item.prediction.display_label} "
-        f"({item.prediction.confidence * 100:.1f}%)": index
+        (
+            f"{format_seconds(item.start_seconds)} – "
+            f"{format_seconds(item.end_seconds)} | "
+            f"{item.prediction.display_label} "
+            f"({item.prediction.confidence * 100:.1f}%)"
+        ): index
         for index, item in enumerate(results)
     }
-    selected_label = st.selectbox("Lihat frame representatif", tuple(choices))
+
+    selected_label = st.selectbox(
+        "Pratinjau segmen",
+        tuple(choices),
+    )
     selected = results[choices[selected_label]]
     st.image(
-        cv2.cvtColor(selected.preview_bgr, cv2.COLOR_BGR2RGB),
+        cv2.cvtColor(
+            selected.preview_bgr,
+            cv2.COLOR_BGR2RGB,
+        ),
         caption=selected_label,
         width="stretch",
     )
 
 
-def render_upload_results(
-    results: list[SegmentPrediction],
+def render_results(
+    results: list[AppSegmentPrediction],
     warnings: list[str],
+    segment_seconds: int,
 ) -> None:
+    """Menampilkan ringkasan dan hasil setiap segmen."""
+    if warnings:
+        with st.expander("Catatan analisis"):
+            for message in warnings:
+                st.write(message)
+
     if not results:
-        st.error("Tidak ada segmen video yang berhasil dianalisis.")
+        st.error("Tidak ada segmen video yang dapat dianalisis.")
         return
-    for message in warnings:
-        st.warning(message)
 
-    table = pd.DataFrame([result.as_row() for result in results])
+    table = pd.DataFrame(
+        [result.as_row() for result in results]
+    )
     dominant = table["emosi"].value_counts().index[0]
-    average_confidence = float(table["confidence_persen"].mean())
-    metric_a, metric_b, metric_c = st.columns(3)
-    metric_a.metric("Jumlah segmen", len(table))
-    metric_b.metric("Emosi dominan", str(dominant).upper())
-    metric_c.metric("Rata-rata confidence", f"{average_confidence:.1f}%")
+    average_confidence = float(
+        table["confidence_persen"].mean()
+    )
 
-    st.markdown("#### Timeline emosi")
+    metric_a, metric_b, metric_c = st.columns(3)
+    metric_a.metric("Segmen", len(table))
+    metric_b.metric("Emosi dominan", str(dominant).upper())
+    metric_c.metric(
+        "Confidence rata-rata",
+        f"{average_confidence:.1f}%",
+    )
+
+    st.subheader("Hasil prediksi")
     visible_columns = [
         "mulai_detik",
         "selesai_detik",
         "emosi",
-        "kelas_model",
         "confidence_persen",
-        "wajah_terdeteksi",
+        "frame_wajah",
+        "audio_digunakan",
     ]
     st.dataframe(
         table[visible_columns],
@@ -649,218 +510,211 @@ def render_upload_results(
         width="stretch",
         column_config={
             "mulai_detik": st.column_config.NumberColumn(
-                "Mulai (detik)", format="%.2f"
+                "Mulai",
+                format="%.2f",
             ),
             "selesai_detik": st.column_config.NumberColumn(
-                "Selesai (detik)", format="%.2f"
+                "Selesai",
+                format="%.2f",
             ),
             "emosi": st.column_config.TextColumn("Emosi"),
-            "kelas_model": st.column_config.TextColumn("Kelas model"),
             "confidence_persen": st.column_config.ProgressColumn(
                 "Confidence",
                 min_value=0.0,
                 max_value=100.0,
                 format="%.1f%%",
             ),
-            "wajah_terdeteksi": st.column_config.CheckboxColumn("Wajah"),
+            "frame_wajah": st.column_config.NumberColumn(
+                "Wajah terbaca",
+                format="%d/12",
+            ),
+            "audio_digunakan": st.column_config.CheckboxColumn(
+                "Audio",
+            ),
         },
     )
-
-    st.markdown("#### Distribusi segmen")
-    counts = (
-        table["emosi"]
-        .value_counts()
-        .rename_axis("Emosi")
-        .reset_index(name="Jumlah segmen")
+    st.caption(
+        "Audio yang tidak dicentang berarti segmen tetap diproses dengan input audio nol."
     )
-    st.bar_chart(counts, x="Emosi", y="Jumlah segmen", color="#5B5BD6")
 
     st.download_button(
-        "Unduh hasil lengkap (CSV)",
+        "Unduh CSV",
         data=table.to_csv(index=False).encode("utf-8"),
-        file_name="timeline_emosi_crnn_8_kelas.csv",
+        file_name=f"hasil_8_emosi_{segment_seconds}_detik.csv",
         mime="text/csv",
     )
+
     render_segment_preview(results)
 
 
-def render_upload_tab(bundle: ModelBundle, model_path: Path) -> None:
-    st.subheader("Analisis video berdasarkan interval waktu")
-    st.write(
-        "Unggah video; aplikasi akan membaginya menjadi beberapa segmen dan "
-        "menampilkan emosi yang terdeteksi pada setiap rentang detik."
+def render_video_upload(
+    bundle: ModelBundle,
+    detection_mode: str,
+    segment_seconds: int,
+) -> None:
+    """Menerima video rekaman dan menjalankan analisis."""
+    uploaded = st.file_uploader(
+        "Unggah video",
+        type=["mp4", "mov", "avi", "mkv", "webm", "m4v"],
+        max_upload_size=1024,
     )
-    input_column, settings_column = st.columns([2.0, 1.0], gap="large")
-    with settings_column:
-        st.markdown("#### Konfigurasi analisis")
-        fixed_visual, fixed_audio = st.columns(2)
-        fixed_visual.metric("Visual", "50%")
-        fixed_audio.metric("Suara", "50%")
-        st.metric("Durasi setiap segmen", "3 detik")
-        st.info(
-            "Konfigurasi dikunci agar konsisten dengan training. Setiap segmen "
-            "mengambil 12 frame dan track audio yang sesuai."
-        )
-
-    audio_focus = INFERENCE_AUDIO_FOCUS
-    segment_seconds = ANALYSIS_SEGMENT_SECONDS
-
-    with input_column:
-        uploaded = st.file_uploader(
-            "Pilih video",
-            type=["mp4", "mov", "avi", "mkv", "webm", "m4v"],
-            max_upload_size=500,
-            help="Batas unggahan aplikasi adalah 500 MB per video.",
-        )
-        if uploaded is not None:
-            video_bytes = uploaded.getvalue()
-            st.video(video_bytes)
-            signature = hashlib.sha256(video_bytes).hexdigest()
-            run_signature = (
-                f"{signature}:{model_path}:{audio_focus:.2f}:"
-                f"{segment_seconds:.1f}"
-            )
-            if st.button("Analisis video", type="primary", width="stretch"):
-                progress = st.progress(0.0, text="Menyiapkan video...")
-                status = st.empty()
-
-                def update_progress(done: int, total: int) -> None:
-                    progress.progress(
-                        done / max(1, total),
-                        text=f"Menganalisis segmen {done} dari {total}...",
-                    )
-
-                suffix = Path(uploaded.name).suffix or ".mp4"
-                try:
-                    with tempfile.TemporaryDirectory(
-                        prefix="crnn_keras_upload_"
-                    ) as temp_dir:
-                        video_path = Path(temp_dir) / f"video{suffix}"
-                        video_path.write_bytes(video_bytes)
-                        results, warnings = analyze_video(
-                            video_path,
-                            bundle,
-                            audio_focus,
-                            segment_seconds=segment_seconds,
-                            progress_callback=update_progress,
-                        )
-                    st.session_state.upload_analysis_keras = {
-                        "signature": run_signature,
-                        "results": results,
-                        "warnings": warnings,
-                    }
-                    progress.progress(1.0, text="Analisis selesai.")
-                    status.success(
-                        "Semua segmen yang dapat dibaca sudah dianalisis."
-                    )
-                except Exception as error:
-                    st.session_state.pop("upload_analysis_keras", None)
-                    progress.empty()
-                    status.error(f"Analisis video gagal: {error}")
-
-            saved = st.session_state.get("upload_analysis_keras")
-            if saved:
-                if saved["signature"] != run_signature:
-                    st.warning(
-                        "Video atau model berubah. "
-                        "Tekan **Analisis video** untuk memperbarui hasil."
-                    )
-                else:
-                    render_upload_results(saved["results"], saved["warnings"])
-
-
-def render_model_info(model_path: Path, bundle: ModelBundle) -> None:
-    st.subheader("Informasi model yang sedang dipakai")
-    st.code(str(model_path), language=None)
-    columns = st.columns(4)
-    columns[0].metric("Kelas emosi", len(CLASS_NAMES))
-    columns[1].metric("Frame visual", "12")
-    columns[2].metric("Ukuran wajah", "64 x 64 RGB")
-    columns[3].metric("Input audio", "40 x 531 MFCC")
     st.caption(
-        "Skala modalitas pada posisi 50/50: "
-        f"visual {bundle.base_modality_scale:.2f}, "
-        f"audio {bundle.base_modality_scale:.2f}."
+        "Audio hening tidak menghentikan analisis. Segmen tetap diprediksi menggunakan visual."
     )
-    st.markdown(
-        """
-        Model menggunakan dua cabang CNN-LSTM: visual dan audio. Fitur kedua
-        cabang digabung dengan **model-level fusion**, lalu diklasifikasikan ke
-        delapan kelas RAVDESS. Statistik normalisasi audio berasal dari split
-        training yang sama dengan model.
 
-        Model ini dilatih pada ekspresi terkontrol RAVDESS. Hasil live di dunia
-        nyata dapat berbeda karena pencahayaan, posisi wajah, kualitas mikrofon,
-        bahasa, dan karakter suara. Gunakan hasil sebagai keluaran penelitian,
-        bukan diagnosis psikologis.
-        """
+    if uploaded is None:
+        return
+
+    video_bytes = uploaded.getvalue()
+    st.video(video_bytes)
+
+    signature = hashlib.sha256(video_bytes).hexdigest()
+    run_signature = (
+        f"{signature}:{detection_mode}:{segment_seconds}:"
+        f"{MODEL_PATH.stat().st_mtime_ns}:silent-audio-v1"
     )
+
+    if st.button(
+        "Analisis",
+        type="primary",
+        width="stretch",
+    ):
+        progress = st.progress(
+            0.0,
+            text="Menyiapkan video...",
+        )
+        status = st.empty()
+
+        def update_progress(done: int, total: int) -> None:
+            progress.progress(
+                done / max(1, total),
+                text=f"Memproses {done}/{total}",
+            )
+
+        suffix = Path(uploaded.name).suffix or ".mp4"
+
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="crnn8_upload_"
+            ) as temp_dir:
+                video_path = Path(temp_dir) / f"video{suffix}"
+                video_path.write_bytes(video_bytes)
+                results, warnings = analyze_video_recording(
+                    video_path,
+                    bundle,
+                    segment_seconds,
+                    detection_mode,
+                    progress_callback=update_progress,
+                )
+
+            st.session_state.upload_analysis_8 = {
+                "signature": run_signature,
+                "results": results,
+                "warnings": warnings,
+            }
+            progress.progress(1.0, text="Selesai")
+            status.success("Analisis selesai.")
+        except Exception as error:
+            st.session_state.pop(
+                "upload_analysis_8",
+                None,
+            )
+            progress.empty()
+            status.error(
+                f"Gagal menganalisis video: {error}"
+            )
+
+    saved = st.session_state.get(
+        "upload_analysis_8"
+    )
+    if saved:
+        if saved["signature"] != run_signature:
+            st.info(
+                "Tekan Analisis untuk memperbarui hasil."
+            )
+        else:
+            render_results(
+                saved["results"],
+                saved["warnings"],
+                segment_seconds,
+            )
 
 
 def main() -> None:
     st.set_page_config(
-        page_title="CRNN Multimodal 8 Emosi",
+        page_title="Deteksi Emosi Video – 8 Kelas",
         page_icon="🎭",
-        layout="wide",
-    )
-    st.title("Deteksi Emosi Multimodal CRNN - 8 Kelas")
-    st.caption(
-        "Live webcam + mikrofon dan analisis video menggunakan model Keras "
-        "model-level fusion"
+        layout="centered",
     )
 
-    with st.sidebar:
-        st.header("Model Keras")
-        model_path = MODEL_PATH
-        st.code(str(model_path), language=None)
-        st.caption("Model tunggal: LR 0.0001, 12 frame, test accuracy 75%")
+    st.title("Deteksi Emosi Video")
+    st.caption(
+        "8 emosi • 12 frame • video rekaman"
+    )
+
+    st.subheader("Pengaturan")
+    detection_column, interval_column = st.columns(2)
+
+    with detection_column:
+        detection_label = st.selectbox(
+            "Deteksi wajah",
+            tuple(DETECTION_MODE_LABELS),
+            index=0,
+        )
         st.caption(
-            "Kelas: "
-            + ", ".join(CLASS_DISPLAY_NAMES[name] for name in CLASS_NAMES)
+            "Normal untuk wajah dekat. Jarak jauh membantu saat wajah terlihat lebih kecil."
+        )
+        detection_mode = DETECTION_MODE_LABELS[
+            detection_label
+        ]
+
+    with interval_column:
+        segment_seconds = st.selectbox(
+            "Interval prediksi",
+            SEGMENT_DURATION_OPTIONS,
+            index=2,
+            format_func=lambda value: f"{value} detik",
+        )
+        st.caption(
+            "1 detik lebih rinci. 3 detik biasanya lebih stabil."
         )
 
     required_paths = (
-        model_path,
+        MODEL_PATH,
         MFCC_MEAN_PATH,
         MFCC_STD_PATH,
     )
-    missing = [path for path in required_paths if not path.is_file()]
+    missing = [
+        path
+        for path in required_paths
+        if not path.is_file()
+    ]
     if missing:
-        st.error("Berkas yang diperlukan belum ditemukan: " + ", ".join(map(str, missing)))
+        st.error(
+            "Berkas model belum ditemukan: "
+            + ", ".join(map(str, missing))
+        )
         st.stop()
 
     try:
-        with st.spinner("Memuat model CRNN multimodal 8 kelas..."):
+        with st.spinner("Memuat model..."):
             bundle = get_model_bundle(
-                str(model_path),
-                model_path.stat().st_mtime_ns,
+                str(MODEL_PATH),
+                MODEL_PATH.stat().st_mtime_ns,
                 str(MFCC_MEAN_PATH),
                 MFCC_MEAN_PATH.stat().st_mtime_ns,
                 str(MFCC_STD_PATH),
                 MFCC_STD_PATH.stat().st_mtime_ns,
-                BASE_MODALITY_SCALE,
             )
     except Exception as error:
         st.error(f"Model gagal dimuat: {error}")
         st.stop()
 
-    with st.sidebar:
-        st.success("Model siap digunakan")
-        st.write(f"Ukuran: {model_path.stat().st_size / (1024 * 1024):.2f} MB")
-        st.info(
-            "Fusion dikunci pada visual 50% dan suara 50%, sesuai konfigurasi "
-            "training dan evaluasi model."
-        )
-
-    live_tab, upload_tab, info_tab = st.tabs(
-        ["Kamera langsung", "Unggah video", "Informasi model"]
+    render_video_upload(
+        bundle,
+        detection_mode,
+        segment_seconds,
     )
-    with live_tab:
-        render_live_tab(bundle, model_path)
-    with upload_tab:
-        render_upload_tab(bundle, model_path)
-    with info_tab:
-        render_model_info(model_path, bundle)
 
 
 if __name__ == "__main__":
