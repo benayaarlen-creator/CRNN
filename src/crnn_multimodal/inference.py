@@ -939,15 +939,22 @@ def analyze_video(
     with tempfile.TemporaryDirectory(prefix="crnn_video_audio_") as temp_dir:
         wav_path = Path(temp_dir) / "audio.wav"
         has_audio, audio_error = _extract_audio(path, wav_path)
+
+        audio_file = None
+        if has_audio:
+            try:
+                audio_file = sf.SoundFile(wav_path)
+            except Exception:
+                has_audio = False
+
         if not has_audio:
-            capture.release()
-            raise RuntimeError(
-                "Track audio tidak dapat dibaca. Model multimodal tidak akan "
-                "dipaksakan berjalan dengan audio kosong. "
-                + (audio_error or "")
+            warnings.append(
+                "Video tidak memiliki track audio yang dapat dibaca. "
+                "Prediksi tetap dijalankan menggunakan fitur visual."
             )
 
-        audio_file = sf.SoundFile(wav_path)
+        silent_segment_count = 0
+
         try:
             for segment_index in range(segment_count):
                 start = segment_index * segment_seconds
@@ -967,6 +974,11 @@ def analyze_video(
                     continue
 
                 visual, visual_info = preprocess_frames(frames)
+
+                # Nilai bawaan untuk video tanpa audio atau segmen terlalu hening.
+                audio = empty_audio_input()
+                effective_audio_focus = 0.0
+
                 if audio_file is not None:
                     audio_file.seek(int(start * audio_file.samplerate))
                     requested_frames = max(
@@ -977,19 +989,30 @@ def analyze_video(
                         dtype="float32",
                         always_2d=False,
                     )
-                    if np.asarray(waveform).size:
+                    waveform_array = np.asarray(
+                        waveform, dtype=np.float32
+                    ).reshape(-1)
+                    audio_quality = measure_audio_quality(
+                        waveform_array,
+                        int(audio_file.samplerate),
+                    )
+
+                    if waveform_array.size and audio_quality.has_usable_signal:
                         audio = preprocess_audio(
-                            waveform,
+                            waveform_array,
                             int(audio_file.samplerate),
                             bundle.train_mean,
                             bundle.train_std,
                         )
+                        effective_audio_focus = audio_focus
                     else:
-                        raise RuntimeError(
-                            f"Audio kosong pada segmen {start:.1f}-{end:.1f} detik."
-                        )
+                        silent_segment_count += 1
 
-                prediction = bundle.predict(visual, audio, audio_focus)
+                prediction = bundle.predict(
+                    visual,
+                    audio,
+                    effective_audio_focus,
+                )
                 preview = frames[len(frames) // 2]
                 annotated, overlay_face = annotate_frame(preview, prediction)
                 results.append(
@@ -1010,6 +1033,13 @@ def analyze_video(
             if audio_file is not None:
                 audio_file.close()
             capture.release()
+
+        if silent_segment_count:
+            warnings.append(
+                f"{silent_segment_count} segmen memiliki audio terlalu hening "
+                "dan dianalisis menggunakan fitur visual."
+            )
+
     return results, warnings
 
 
